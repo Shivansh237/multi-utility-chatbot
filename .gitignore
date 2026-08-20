@@ -1,0 +1,60 @@
+# === Environment & Secrets ===
+.env
+.env.*
+*.env
+secrets.toml
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-log.txt
+pip-delete-this-directory.txt
+.installed.cfg
+*.egg
+MANIFEST
+
+# === Virtual Environments ===
+venv/
+env/
+ENV/
+.venv/
+.virtualenv/
+
+# === SQLite Databases ===
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# === Streamlit ===
+.streamlit/secrets.toml
+
+# === IDE / Editor ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*.DS_Store
+Thumbs.db
+desktop.ini
+
+# === Jupyter ===
+.ipynb_checkpoints/
+*.ipynb
+
+# === Logs ===
+*.log
+logs/
+
+# === OS ===
+.DS_Store
+ehthumbs.db
