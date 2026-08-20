@@ -1,10 +1,13 @@
 from __future__ import annotations
-
+import asyncio
 import os
 import sqlite3
 import tempfile
 from typing import Annotated, Any, Dict, Optional, TypedDict
-
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
 from dotenv import load_dotenv
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
