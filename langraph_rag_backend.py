@@ -33,7 +33,7 @@ llm = ChatGoogleGenerativeAI(
     google_api_key=google_api_key,
     thinking_level="minimal",
 )
-embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=google_api_key)
+embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001", google_api_key=google_api_key)
 
 # -------------------
 # 2. PDF retriever store (per thread)
