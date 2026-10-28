@@ -1,201 +1,138 @@
-# 🤖 Multi Utility Chatbot — LangGraph + Gemini + Streamlit
+# Multi Utility Chatbot
 
-An AI agent that chats with your PDFs, searches the web, fetches live stock prices, and does math, all in one chat window. Built with **LangGraph** for the agent loop, **Google Gemini** as the LLM, **FAISS** for PDF search, and **Streamlit** for the UI.
+A chatbot built with LangGraph and Google Gemini that can answer questions about a PDF you upload, search the web, look up stock prices and solve math expressions. The agent decides by itself which tool to use for each question. The UI is made with Streamlit.
 
-**🔗 Live demo:** _coming soon_ <!-- replace with your Render URL, e.g. https://multi-utility-chatbot.onrender.com -->
+**Live demo:** coming soon <!-- add Render URL here -->
 
-<!-- Add a demo GIF here once deployed:
-![Demo](assets/demo.gif)
--->
+<!-- ![Demo](assets/demo.gif) -->
 
----
+## Features
 
-## ✨ Features
+- **Chat with a PDF (RAG):** upload a PDF, it gets split into chunks, embedded with Gemini embeddings and stored in a FAISS index. Questions about the document are answered from the most relevant chunks.
+- **Web search** using DuckDuckGo, for questions about recent events.
+- **Stock prices** from the Alpha Vantage API (e.g. AAPL, TSLA).
+- **Calculator** that evaluates whole expressions like `(3+4)*2^5` or `sqrt(144)/3`. It uses numexpr instead of `eval()`, so it can't execute arbitrary code.
+- **Chat history** saved in SQLite through LangGraph's checkpointer, so old conversations are still there after restarting the app.
+- **Chat titles:** after the first message Gemini generates a short title for the chat (like ChatGPT does). If that call fails, the first message is used as the title.
+- **Streaming responses**, with a status box that shows which tool is being used.
+- **Own API key option:** visitors of the demo can enter their own Gemini key. Without one they get a limited number of free messages.
+- Error handling for rate limits, invalid keys and scanned PDFs without text, so the app shows a message instead of crashing.
+- Optional tracing with LangSmith.
 
-| Feature | Description |
-|---|---|
-| 📄 **Chat with your PDF (RAG)** | Upload a PDF and ask questions about it. The text is split into chunks, embedded with Gemini, and searched with FAISS |
-| 🌐 **Web search** | Answers questions about current events using DuckDuckGo |
-| 📈 **Stock prices** | Live stock quotes (e.g. `AAPL`, `TSLA`) via Alpha Vantage |
-| 🧮 **Safe calculator** | Evaluates full math expressions like `(3+4)*2^5` or `sqrt(144)/3` with numexpr — no `eval()`, so it can't run harmful code |
-| 🤖 **Agent decides the tool** | Gemini picks which tool to use (or none) for each question, using LangGraph's tool-calling loop |
-| 💬 **Chat memory** | Every conversation is saved in SQLite with LangGraph's checkpointer, so old chats survive an app restart |
-| 🏷️ **Auto chat titles** | Like ChatGPT: after the first message, Gemini writes a short title for the chat (e.g. *"Tesla Stock Price Query"*). If that fails, the first message is used as the title |
-| ⚡ **Streaming answers** | Answers appear word by word, with a status box showing which tool is running |
-| 🔑 **Bring your own key** | Visitors can paste their own Gemini API key in the sidebar. Without one, they get a limited number of free messages |
-| 🛡️ **Friendly errors** | Rate limits, invalid API keys, and scanned (text-less) PDFs show a clear message instead of crashing the app |
-| 🔍 **LangSmith tracing** | Optional tracing of every agent step for debugging |
-
----
-
-## 🏗️ Architecture
+## How it works
 
 ```
-            Streamlit UI  (streamlit_rag_frontend.py)
-   sidebar: chats + titles, PDF upload, own API key, free-message counter
-                              │
-                              ▼
-           LangGraph agent  (langraph_rag_backend.py)
+Streamlit UI (streamlit_rag_frontend.py)
+        |
+        v
+LangGraph agent (langraph_rag_backend.py)
 
-        START ──► chat_node ──(tool call?)──► tools ──┐
-                  (Gemini)         │                  │
-                     ▲             │ no               │
-                     │             ▼                  │
-                     │            END                 │
-                     └────────────────────────────────┘
+   START -> chat_node -> tool call? --yes--> tools --+
+              ^              |                       |
+              |              no -> END               |
+              +--------------------------------------+
 
-   tools:  rag_tool (FAISS)  ·  DuckDuckGo search  ·  get_stock_price  ·  calculator
-                              │
-                              ▼
-        SQLite (chatbot.db): chat history (checkpoints) + chat titles
+   tools: rag_tool (FAISS), DuckDuckGo search, get_stock_price, calculator
+        |
+        v
+SQLite (chatbot.db): chat history + chat titles
 ```
 
-**How one question flows through the app:**
+1. The user's message is sent to the graph together with the chat's `thread_id`.
+2. `chat_node` sends the conversation and a system prompt to Gemini.
+3. If Gemini asks for a tool, the `tools` node runs it and the result goes back to `chat_node`.
+4. This repeats until Gemini gives a normal text answer, which is streamed to the UI.
+5. The checkpointer saves the state in SQLite after every step.
 
-1. You type a question. Streamlit sends it to the LangGraph agent with the chat's `thread_id`.
-2. `chat_node` sends the full conversation (plus a system prompt with today's date) to Gemini.
-3. If Gemini wants a tool, for example the calculator, LangGraph runs it in the `tools` node and sends the result back to `chat_node`.
-4. This repeats until Gemini answers in plain text. The answer streams to the UI.
-5. LangGraph's checkpointer saves the conversation in SQLite after every step.
+Some things I ran into while building it:
 
-**Design decisions worth noting:**
+- At first the LLM had to pass the `thread_id` to `rag_tool` itself, and it didn't always do it correctly. Now the tool reads it from the run config.
+- Web search answers were sometimes outdated, because the model trusted its training data more than the search results. Adding today's date to the system prompt fixed it.
+- The first version of the calculator only took two numbers and an operation. I switched to numexpr so it handles full expressions without the security problems of `eval()`.
 
-- **`thread_id` is injected into `rag_tool` from the run config**, not passed by the LLM. The model can't pick the wrong document by mistake.
-- **Today's date is in the system prompt.** Without it, the model trusted its old training data over fresh web search results, for example answering with the 2022 World Cup in 2026.
-- **The calculator uses numexpr instead of `eval()`.** `eval()` runs any Python code; numexpr only understands math.
-
----
-
-## 🚀 Run locally
-
-### 1. Clone the repository
+## Running locally
 
 ```bash
 git clone https://github.com/Shivansh237/multi-utility-chatbot.git
 cd multi-utility-chatbot
-```
 
-### 2. Create & activate a virtual environment
-
-```bash
 python -m venv venv
-# Windows
-venv\Scripts\activate
-# macOS / Linux
-source venv/bin/activate
-```
+venv\Scripts\activate        # Windows
+source venv/bin/activate     # macOS / Linux
 
-### 3. Install dependencies
-
-```bash
 pip install -r requirements.txt
 ```
 
-### 4. Add your API keys
-
-```bash
-cp .env.example .env
-```
-
-Then open `.env` and fill in at least `GEMINI_API_KEY` (see [Environment variables](#️-environment-variables)).
-
-### 5. Run the app
+Copy `.env.example` to `.env` and add your keys (at least `GEMINI_API_KEY`). Then start the app:
 
 ```bash
 streamlit run streamlit_rag_frontend.py
 ```
 
-Open [http://localhost:8501](http://localhost:8501) in your browser.
+It opens at http://localhost:8501.
 
-**Try asking:**
-- *"What is (25 * 4) + sqrt(144) / 3?"* → calculator
-- *"What is the current stock price of AAPL?"* → stock tool
-- *"Search the web: latest news about AI"* → web search
-- Upload a PDF, then *"Summarize this document"* → RAG
+Some example questions:
+- "What is (25 * 4) + sqrt(144) / 3?"
+- "What is the current stock price of AAPL?"
+- "Search the web for the latest AI news"
+- upload a PDF and ask "Summarize this document"
 
----
+## Deployment (Render)
 
-## ☁️ Deploy on Render (free)
+The repo has a `render.yaml`, so it can be deployed as a Render Blueprint:
 
-This repo includes a [`render.yaml`](render.yaml) file, so Render can set everything up automatically.
+1. On render.com go to **New > Blueprint** and select this repository.
+2. Enter `GEMINI_API_KEY` and `ALPHA_VANTAGE_API_KEY` when asked.
+3. Click **Apply** and wait for the build to finish.
 
-1. Push this project to a GitHub repository (make sure `.env` is **not** committed — it's in `.gitignore`).
-2. Go to [render.com](https://render.com) → **New +** → **Blueprint** → select your repository.
-3. Render reads `render.yaml` and asks for the secret values. Enter:
-   - `GEMINI_API_KEY`
-   - `ALPHA_VANTAGE_API_KEY`
-4. Click **Apply**. The first build takes a few minutes. Then open the `.onrender.com` URL.
-5. Paste that URL into the **Live demo** line at the top of this README.
+`render.yaml` also sets `PUBLIC_MODE=true` (each visitor only sees their own chats) and `FREE_MESSAGE_LIMIT=10`.
 
-`render.yaml` also sets `PUBLIC_MODE=true` (visitors only see their own chats) and `FREE_MESSAGE_LIMIT=10`.
+On the free plan the service sleeps after about 15 minutes without traffic, so the first request can take up to a minute. The disk is not persistent either, so chats are lost when the service restarts.
 
-> **Note:** On Render's free plan the app sleeps after ~15 minutes without visitors, so the first visit can take 30–60 seconds to load. The disk is also temporary, so chats and PDF indexes reset when the app restarts.
-
----
-
-## ⚙️ Environment variables
+## Environment variables
 
 | Variable | Required | Description |
 |---|---|---|
-| `GEMINI_API_KEY` | ✅ | Google Gemini key for the LLM and embeddings — [get one free](https://aistudio.google.com/app/apikey) |
-| `ALPHA_VANTAGE_API_KEY` | For stock prices | [Get one free](https://www.alphavantage.co/support/#api-key) (about 25 requests/day) |
-| `GEMINI_MODEL` | No | Gemini model name (default `gemini-3.6-flash`) |
-| `FREE_MESSAGE_LIMIT` | No | Messages a visitor can send with your key before they must add their own (default `10`) |
-| `PUBLIC_MODE` | No | `true` = each visitor only sees their own chats in the sidebar (default `false`) |
-| `LANGSMITH_TRACING`, `LANGSMITH_API_KEY`, `LANGSMITH_ENDPOINT`, `LANGSMITH_PROJECT` | No | Turn on LangSmith tracing — [smith.langchain.com](https://smith.langchain.com) |
+| `GEMINI_API_KEY` | yes | Gemini key for the LLM and embeddings ([get one](https://aistudio.google.com/app/apikey)) |
+| `ALPHA_VANTAGE_API_KEY` | for stock prices | [get one](https://www.alphavantage.co/support/#api-key), free tier is about 25 requests/day |
+| `GEMINI_MODEL` | no | model name, default `gemini-3.6-flash` |
+| `FREE_MESSAGE_LIMIT` | no | free messages per visitor without their own key, default `10` |
+| `PUBLIC_MODE` | no | `true` = visitors only see their own chats, default `false` |
+| `LANGSMITH_*` | no | LangSmith tracing settings |
 
----
-
-## 📁 Project structure
+## Project structure
 
 ```
 multi-utility-chatbot/
-├── streamlit_rag_frontend.py  # Streamlit UI: chat, sidebar, PDF upload, own-key box
-├── langraph_rag_backend.py    # LangGraph agent, tools, PDF ingestion, chat titles
-├── requirements.txt           # Python dependencies
-├── render.yaml                # Render deployment config
-├── .env.example               # Template for your .env file
-├── .env                       # Your secrets (git-ignored)
-├── chatbot.db                 # SQLite database, created automatically (git-ignored)
+├── streamlit_rag_frontend.py   # Streamlit UI
+├── langraph_rag_backend.py     # LangGraph agent, tools, PDF ingestion, chat titles
+├── requirements.txt
+├── render.yaml                 # Render deployment config
+├── .env.example
 └── README.md
 ```
 
----
+## Tech stack
 
-## 🛠️ Tech stack
+LangGraph, LangChain, Google Gemini (`gemini-3.6-flash`, `gemini-embedding-001`), FAISS, Streamlit, SQLite, numexpr, DuckDuckGo search, Alpha Vantage, Render.
 
-- **[LangGraph](https://github.com/langchain-ai/langgraph)** — agent loop (chat node ↔ tool node) and SQLite checkpointing
-- **[LangChain](https://github.com/langchain-ai/langchain)** — tools, PDF loader, text splitter
-- **[Google Gemini](https://ai.google.dev/)** — LLM (`gemini-3.6-flash`) and embeddings (`gemini-embedding-001`)
-- **[FAISS](https://github.com/facebookresearch/faiss)** — vector similarity search for PDF chunks
-- **[Streamlit](https://streamlit.io/)** — web UI with streaming
-- **[SQLite](https://www.sqlite.org/)** — chat history and chat titles
-- **[numexpr](https://github.com/pydata/numexpr)** — safe math evaluation
-- **[DuckDuckGo Search](https://pypi.org/project/ddgs/)** — web search
-- **[Render](https://render.com)** — hosting
+## Limitations / what I want to improve
 
----
+**Current limitations**
 
-## ⚠️ Limitations & future improvements
+- The FAISS index is only kept in memory. Chat history survives a restart, but the PDF has to be uploaded again.
+- Only one PDF per chat. A new upload replaces the old one.
+- The free message counter is per browser session, so refreshing the page resets it.
+- Gemini's free tier has low request limits, and one question usually takes 2 requests (one for the tool call, one for the answer).
 
-### Current limitations
+**Next steps**
 
-- **PDF index is kept in memory.** Chat history is saved in SQLite and survives a restart, but the FAISS index for uploaded PDFs lives in RAM. After a restart you have to upload the PDF again.
-- **One PDF per chat.** Uploading a second PDF in the same chat replaces the first one.
-- **Free hosting resets data.** On Render's free plan the disk is temporary, so chat history and indexes reset after inactivity or a redeploy.
-- **Free message limit is per browser session.** Refreshing the page resets the counter. It protects against accidental overuse, not against someone determined to abuse it.
-- **API limits.** Gemini's free tier allows only a few requests per minute, and each question uses about 2. The free Alpha Vantage key allows about 25 requests per day.
+- Save the FAISS index to disk (`save_local` / `load_local`), or use a vector database like ChromaDB or pgvector when there are multiple users.
+- Move chat history from SQLite to Postgres so it isn't lost on redeploys.
+- Show page numbers as sources in the answers (they are already in the chunk metadata).
+- Evaluate the RAG answers with RAGAS or LangSmith.
+- Add a FastAPI backend so the agent can be used from other frontends.
 
-### Planned improvements
+## License
 
-- **Persistent vector store.** Save the FAISS index to disk (`save_local` / `load_local`) for a single user, or move to a vector database such as ChromaDB or pgvector for a multi-user deployment.
-- **Managed database.** Move chat history from SQLite to Postgres so it survives redeploys.
-- **Source citations.** Show the page number of each retrieved chunk in the answer (already available in the chunk metadata).
-- **RAG evaluation.** Measure answer quality with RAGAS / LangSmith evaluations and track improvements.
-- **API layer.** Add a FastAPI backend so other frontends can use the agent.
-
----
-
-## 📝 License
-
-MIT License — feel free to use, modify, and distribute.
+MIT

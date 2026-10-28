@@ -31,13 +31,11 @@ load_dotenv()
 # -------------------
 # 1. LLM + embeddings
 # -------------------
-# The app owner's key from .env. Visitors can also use their own key (see frontend).
 DEFAULT_API_KEY = os.getenv("GEMINI_API_KEY")
 MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
 
 def make_llm(api_key: Optional[str] = None):
-    """Create the Gemini chat model. Uses the default key if no key is given."""
     return ChatGoogleGenerativeAI(
         model=MODEL_NAME,
         google_api_key=api_key or DEFAULT_API_KEY,
@@ -46,7 +44,6 @@ def make_llm(api_key: Optional[str] = None):
 
 
 def make_embeddings(api_key: Optional[str] = None):
-    """Create the Gemini embedding model. Uses the default key if no key is given."""
     return GoogleGenerativeAIEmbeddings(
         model="gemini-embedding-001", google_api_key=api_key or DEFAULT_API_KEY
     )
@@ -132,17 +129,13 @@ def calculator(expression: str) -> dict:
     Evaluate a math expression, e.g. "(3 + 4) * 2**5" or "sqrt(16) + 10 % 3".
     Supports + - * / ** %, brackets, and functions like sqrt, sin, cos, log.
     """
-    # People often write 2^5 for power, but in Python power is 2**5
-    clean_expression = expression.replace("^", "**")
-
+    # numexpr instead of eval() so the LLM can't make us run arbitrary code
     try:
-        # numexpr only understands math, so it can't run harmful code like eval() can
-        result = numexpr.evaluate(clean_expression).item()
+        result = numexpr.evaluate(expression.replace("^", "**")).item()
     except Exception as e:
         return {"error": f"Invalid expression '{expression}': {e}"}
 
-    # numexpr gives "inf" or "nan" instead of an error for things like 1/0
-    if not math.isfinite(result):
+    if not math.isfinite(result):  # e.g. 1.0/0 gives inf instead of raising
         return {"error": "Result is undefined (for example, division by zero)"}
 
     return {"expression": expression, "result": result}
@@ -167,7 +160,7 @@ def get_stock_price(symbol: str) -> dict:
         data = r.json()
     except (requests.RequestException, ValueError) as e:
         return {"error": f"Stock API request failed: {e}"}
-    # Alpha Vantage returns HTTP 200 with a "Note"/"Information" field when rate-limited.
+    # when rate limited Alpha Vantage still returns 200, with a "Note"/"Information" field
     if "Global Quote" not in data or not data["Global Quote"]:
         return {"error": data.get("Note") or data.get("Information") or f"No quote found for '{symbol}'"}
     return data
@@ -178,7 +171,7 @@ def rag_tool(query: str, config: RunnableConfig) -> dict:
     """
     Retrieve relevant information from the PDF uploaded in this chat.
     """
-    # thread_id is injected from the run config, so the LLM never has to pass it.
+    # thread_id comes from the run config, the LLM doesn't need to pass it
     thread_id = config.get("configurable", {}).get("thread_id")
     retriever = _get_retriever(thread_id)
     if retriever is None:
@@ -219,18 +212,14 @@ checkpointer = SqliteSaver(conn=conn)
 # 6. Nodes + Graph
 # -------------------
 def build_chatbot(api_key: Optional[str] = None):
-    """
-    Build the chatbot graph using the given Gemini key (or the default key).
-    All chatbots share the same SQLite checkpointer, so chat history is the same.
-    """
+    """Compile the graph with a given Gemini key. All graphs share one checkpointer."""
     llm_with_tools = make_llm(api_key).bind_tools(tools)
 
     def chat_node(state: ChatState, config: RunnableConfig):
         """LLM node that may answer or request a tool call."""
         system_message = SystemMessage(
             content=(
-                # The model doesn't know today's date, so we tell it. Without this it
-                # trusts its old training data over fresh web search results.
+                # without the date the model trusts its training data over search results
                 f"Today's date is {date.today():%d %B %Y}. "
                 "You are a helpful assistant. For questions about the uploaded PDF, call "
                 "the `rag_tool`. You can also use the web search, stock price, and "
@@ -254,20 +243,17 @@ def build_chatbot(api_key: Optional[str] = None):
     return graph.compile(checkpointer=checkpointer)
 
 
-# Default chatbot that uses the key from .env
 chatbot = build_chatbot()
 
 # -------------------
 # 7. Helpers
 # -------------------
 def retrieve_all_threads():
-    # checkpointer.list() gives the newest checkpoints first.
-    # A dict keeps that order and removes duplicates (a set would shuffle them).
+    # checkpoints come newest first; dict keeps that order while removing duplicates
     all_threads = {}
     for checkpoint in checkpointer.list(None):
         all_threads[checkpoint.config["configurable"]["thread_id"]] = True
-    # Return oldest first, because the frontend reverses the list to show newest on top
-    return list(all_threads)[::-1]
+    return list(all_threads)[::-1]  # oldest first, the frontend reverses it
 
 
 # -------------------
@@ -293,13 +279,11 @@ def has_title(thread_id: str) -> bool:
 
 
 def short_text(text: str, max_len: int = 40) -> str:
-    """Cut long text to max_len characters, adding … at the end."""
-    text = " ".join(text.split())  # remove extra spaces and newlines
+    text = " ".join(text.split())
     return text if len(text) <= max_len else text[: max_len - 1] + "…"
 
 
 def generate_title(first_message: str, api_key: Optional[str] = None) -> str:
-    """Ask Gemini for a short chat title. If that fails, use the message itself."""
     prompt = (
         "Generate a concise 3 to 5 word title for a chat that starts with this message:\n"
         f'"{first_message}"\n'
@@ -310,19 +294,18 @@ def generate_title(first_message: str, api_key: Optional[str] = None) -> str:
         if title:
             return short_text(title)
     except Exception:
-        pass  # e.g. rate limit -> use the fallback below
+        pass  # rate limit etc., fall back to the message itself
     return short_text(first_message)
 
 
 def get_chat_title(thread_id: str) -> str:
-    """Title for the sidebar: saved title -> first user message -> 'New chat'."""
     row = conn.execute(
         "SELECT title FROM chat_titles WHERE thread_id = ?", (str(thread_id),)
     ).fetchone()
     if row:
         return row[0]
 
-    # Old chats made before titles existed: use their first message
+    # chats created before titles were added
     state = chatbot.get_state(config={"configurable": {"thread_id": str(thread_id)}})
     for msg in state.values.get("messages", []):
         if msg.type == "human":
