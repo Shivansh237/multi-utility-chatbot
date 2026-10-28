@@ -1,0 +1,22 @@
+# Render deployment config ("Blueprint").
+# On render.com: New + -> Blueprint -> pick this repo. Render reads this file.
+services:
+  - type: web
+    name: multi-utility-chatbot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run streamlit_rag_frontend.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.2
+      # sync: false = Render asks you to type the secret value in the dashboard
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: ALPHA_VANTAGE_API_KEY
+        sync: false
+      - key: FREE_MESSAGE_LIMIT
+        value: "10"
+      # Visitors only see their own chats in the sidebar
+      - key: PUBLIC_MODE
+        value: "true"

@@ -1,3 +1,4 @@
+import os
 import uuid 
  
 import streamlit as st 
@@ -14,16 +15,22 @@ from langchain_core.messages import (
 # ============================================
 
 from langraph_rag_backend import ( 
-    chatbot, 
-    ingest_pdf, 
-    retrieve_all_threads, 
-    thread_document_metadata, 
-) 
+    build_chatbot,
+    chatbot,
+    generate_title,
+    get_chat_title,
+    has_title,
+    ingest_pdf,
+    retrieve_all_threads,
+    save_title,
+    thread_document_metadata,
+)
  
  
 # =========================== Utilities =========================== 
 def generate_thread_id(): 
-    return uuid.uuid4() 
+    # Keep thread ids as strings everywhere (the DB returns strings too).
+    return str(uuid.uuid4()) 
  
  
 def reset_chat(): 
@@ -81,11 +88,23 @@ if "message_history" not in st.session_state:
 if "thread_id" not in st.session_state: 
     st.session_state["thread_id"] = generate_thread_id() 
  
-if "chat_threads" not in st.session_state: 
-    st.session_state["chat_threads"] = retrieve_all_threads() 
+if "chat_threads" not in st.session_state:
+    # On a public demo, visitors should not see each other's chats, so each
+    # browser session starts with an empty list. Locally, show all saved chats.
+    if os.getenv("PUBLIC_MODE", "false").lower() == "true":
+        st.session_state["chat_threads"] = []
+    else:
+        st.session_state["chat_threads"] = retrieve_all_threads()
  
 if "ingested_docs" not in st.session_state: 
     st.session_state["ingested_docs"] = {} 
+
+# How many messages a visitor can send with the app owner's Gemini key.
+# Visitors who paste their own key have no limit.
+FREE_MESSAGE_LIMIT = int(os.getenv("FREE_MESSAGE_LIMIT", "10"))
+
+if "free_messages_used" not in st.session_state:
+    st.session_state["free_messages_used"] = 0
  
 add_thread(st.session_state["thread_id"]) 
  
@@ -96,11 +115,27 @@ selected_thread = None
  
 # ============================ Sidebar ============================ 
 st.sidebar.title("LangGraph PDF Chatbot") 
-st.sidebar.markdown(f"**Thread ID:** `{thread_key}`") 
+st.sidebar.markdown(f"**Current chat:** {get_chat_title(thread_key)}")
  
-if st.sidebar.button("New Chat", use_container_width=True): 
+if st.sidebar.button("➕ New Chat", use_container_width=True):
     reset_chat() 
     st.rerun() 
+
+with st.sidebar.expander("🔑 Use your own Gemini key"):
+    user_api_key = st.text_input(
+        "Gemini API key (optional)",
+        type="password",
+        help="Get a free key at aistudio.google.com. It is only used for this session and never saved.",
+    ).strip()
+
+if user_api_key:
+    st.sidebar.caption("Using your own key — no message limit.")
+else:
+    left = FREE_MESSAGE_LIMIT - st.session_state["free_messages_used"]
+    st.sidebar.caption(f"Free messages left: {max(left, 0)} / {FREE_MESSAGE_LIMIT}")
+
+# Use the visitor's key if they gave one, otherwise the default chatbot
+active_chatbot = build_chatbot(user_api_key) if user_api_key else chatbot
  
 if thread_docs: 
     latest_doc = list(thread_docs.values())[-1] 
@@ -113,7 +148,10 @@ else:
  
 uploaded_pdf = st.sidebar.file_uploader(
     "Upload a PDF for this chat",
-    type=["pdf"]
+    type=["pdf"],
+    # Per-thread key so "New Chat" starts with an empty uploader instead of
+    # silently re-indexing the previous chat's PDF into the new thread.
+    key=f"uploader-{thread_key}",
 ) 
 
 if uploaded_pdf: 
@@ -127,19 +165,28 @@ if uploaded_pdf:
             expanded=True
         ) as status_box: 
 
-            summary = ingest_pdf( 
-                uploaded_pdf.getvalue(), 
-                thread_id=thread_key, 
-                filename=uploaded_pdf.name, 
-            ) 
+            try:
+                summary = ingest_pdf(
+                    uploaded_pdf.getvalue(),
+                    thread_id=thread_key,
+                    filename=uploaded_pdf.name,
+                    api_key=user_api_key or None,
+                )
 
-            thread_docs[uploaded_pdf.name] = summary 
+                thread_docs[uploaded_pdf.name] = summary
 
-            status_box.update(
-                label="✅ PDF indexed",
-                state="complete",
-                expanded=False
-            ) 
+                status_box.update(
+                    label="✅ PDF indexed",
+                    state="complete",
+                    expanded=False
+                )
+            except Exception as e:
+                # e.g. a scanned PDF with no text, or an API limit
+                status_box.update(
+                    label=f"❌ Could not index PDF: {e}",
+                    state="error",
+                    expanded=True
+                )
  
 st.sidebar.subheader("Past conversations") 
 
@@ -149,9 +196,12 @@ if not threads:
 else: 
     for thread_id in threads: 
         if st.sidebar.button(
-            str(thread_id),
-            key=f"side-thread-{thread_id}"
-        ): 
+            get_chat_title(thread_id),
+            key=f"side-thread-{thread_id}",
+            use_container_width=True,
+            # Highlight the chat that is open right now
+            type="primary" if str(thread_id) == thread_key else "secondary",
+        ):
             selected_thread = thread_id 
  
 # ============================ Main Layout ======================== 
@@ -172,6 +222,14 @@ for message in st.session_state["message_history"]:
 user_input = st.chat_input(
     "Ask about your document or use tools"
 ) 
+
+# Stop visitors from using up the owner's free Gemini quota
+if user_input and not user_api_key and st.session_state["free_messages_used"] >= FREE_MESSAGE_LIMIT:
+    st.warning(
+        f"You have used all {FREE_MESSAGE_LIMIT} free messages. "
+        "Add your own Gemini key in the sidebar (🔑) to keep chatting."
+    )
+    user_input = None
  
 if user_input: 
 
@@ -198,13 +256,25 @@ if user_input:
     with st.chat_message("assistant"): 
         status_holder = {"box": None} 
  
-        def ai_only_stream(): 
+        def ai_only_stream():
+            try:
+                yield from stream_answer()
+            except Exception as e:
+                # Show a friendly message instead of a red crash screen
+                if "RESOURCE_EXHAUSTED" in str(e) or "429" in str(e):
+                    yield "⚠️ Too many requests right now (Gemini free-tier limit). Please wait a minute and try again."
+                elif "API_KEY_INVALID" in str(e) or "API key not valid" in str(e):
+                    yield "⚠️ This Gemini API key is not valid. Please check the key in the sidebar."
+                else:
+                    yield f"⚠️ Something went wrong: {e}"
 
-            for message_chunk, _ in chatbot.stream( 
-                {"messages": [HumanMessage(content=user_input)]}, 
-                config=CONFIG, 
-                stream_mode="messages", 
-            ): 
+        def stream_answer():
+
+            for message_chunk, _ in active_chatbot.stream(
+                {"messages": [HumanMessage(content=user_input)]},
+                config=CONFIG,
+                stream_mode="messages",
+            ):
 
                 # Tool messages are still handled exactly
                 # as they were in your original code.
@@ -273,8 +343,18 @@ if user_input:
             "role": "assistant",
             "content": ai_message
         }
-    ) 
- 
+    )
+
+    # Count only real answers, not error messages (they start with ⚠️)
+    if not user_api_key and not str(ai_message).startswith("⚠️"):
+        st.session_state["free_messages_used"] += 1
+
+    # First message of a brand-new chat (1 user + 1 assistant message so far):
+    # give the chat a title and rerun so the sidebar shows it right away.
+    if len(st.session_state["message_history"]) == 2 and not has_title(thread_key):
+        save_title(thread_key, generate_title(user_input, api_key=user_api_key or None))
+        st.rerun()
+
     doc_meta = thread_document_metadata(thread_key) 
 
     if doc_meta: 
@@ -297,6 +377,13 @@ if selected_thread:
     temp_messages = [] 
 
     for msg in messages: 
+
+        # Skip tool outputs (raw JSON) and tool-call-only AI messages,
+        # otherwise they show up as junk/empty assistant bubbles.
+        if not isinstance(msg, (HumanMessage, AIMessage)):
+            continue
+        if not extract_text(msg.content).strip():
+            continue
 
         role = (
             "user"

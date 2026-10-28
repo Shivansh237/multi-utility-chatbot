@@ -1,8 +1,10 @@
 from __future__ import annotations
 import asyncio
+import math
 import os
 import sqlite3
 import tempfile
+from datetime import date
 from typing import Annotated, Any, Dict, Optional, TypedDict
 try:
     asyncio.get_event_loop()
@@ -14,12 +16,14 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.tools import DuckDuckGoSearchRun
 from langchain_community.vectorstores import FAISS
 from langchain_core.messages import BaseMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
+import numexpr
 import requests
 
 load_dotenv()
@@ -27,13 +31,26 @@ load_dotenv()
 # -------------------
 # 1. LLM + embeddings
 # -------------------
-google_api_key = os.getenv("GEMINI_API_KEY")
-llm = ChatGoogleGenerativeAI(
-    model="gemini-3.6-flash",
-    google_api_key=google_api_key,
-    thinking_level="minimal",
-)
-embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001", google_api_key=google_api_key)
+# The app owner's key from .env. Visitors can also use their own key (see frontend).
+DEFAULT_API_KEY = os.getenv("GEMINI_API_KEY")
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+
+
+def make_llm(api_key: Optional[str] = None):
+    """Create the Gemini chat model. Uses the default key if no key is given."""
+    return ChatGoogleGenerativeAI(
+        model=MODEL_NAME,
+        google_api_key=api_key or DEFAULT_API_KEY,
+        thinking_level="minimal",
+    )
+
+
+def make_embeddings(api_key: Optional[str] = None):
+    """Create the Gemini embedding model. Uses the default key if no key is given."""
+    return GoogleGenerativeAIEmbeddings(
+        model="gemini-embedding-001", google_api_key=api_key or DEFAULT_API_KEY
+    )
+
 
 # -------------------
 # 2. PDF retriever store (per thread)
@@ -49,7 +66,12 @@ def _get_retriever(thread_id: Optional[str]):
     return None
 
 
-def ingest_pdf(file_bytes: bytes, thread_id: str, filename: Optional[str] = None) -> dict:
+def ingest_pdf(
+    file_bytes: bytes,
+    thread_id: str,
+    filename: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> dict:
     """
     Build a FAISS retriever for the uploaded PDF and store it for the thread.
 
@@ -70,8 +92,10 @@ def ingest_pdf(file_bytes: bytes, thread_id: str, filename: Optional[str] = None
             chunk_size=1000, chunk_overlap=200, separators=["\n\n", "\n", " ", ""]
         )
         chunks = splitter.split_documents(docs)
+        if not chunks:
+            raise ValueError("No text found in this PDF (it may be a scanned image).")
 
-        vector_store = FAISS.from_documents(chunks, embeddings)
+        vector_store = FAISS.from_documents(chunks, make_embeddings(api_key))
         retriever = vector_store.as_retriever(
             search_type="similarity", search_kwargs={"k": 4}
         )
@@ -103,33 +127,25 @@ search_tool = DuckDuckGoSearchRun(region="us-en")
 
 
 @tool
-def calculator(first_num: float, second_num: float, operation: str) -> dict:
+def calculator(expression: str) -> dict:
     """
-    Perform a basic arithmetic operation on two numbers.
-    Supported operations: add, sub, mul, div
+    Evaluate a math expression, e.g. "(3 + 4) * 2**5" or "sqrt(16) + 10 % 3".
+    Supports + - * / ** %, brackets, and functions like sqrt, sin, cos, log.
     """
-    try:
-        if operation == "add":
-            result = first_num + second_num
-        elif operation == "sub":
-            result = first_num - second_num
-        elif operation == "mul":
-            result = first_num * second_num
-        elif operation == "div":
-            if second_num == 0:
-                return {"error": "Division by zero is not allowed"}
-            result = first_num / second_num
-        else:
-            return {"error": f"Unsupported operation '{operation}'"}
+    # People often write 2^5 for power, but in Python power is 2**5
+    clean_expression = expression.replace("^", "**")
 
-        return {
-            "first_num": first_num,
-            "second_num": second_num,
-            "operation": operation,
-            "result": result,
-        }
+    try:
+        # numexpr only understands math, so it can't run harmful code like eval() can
+        result = numexpr.evaluate(clean_expression).item()
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"Invalid expression '{expression}': {e}"}
+
+    # numexpr gives "inf" or "nan" instead of an error for things like 1/0
+    if not math.isfinite(result):
+        return {"error": "Result is undefined (for example, division by zero)"}
+
+    return {"expression": expression, "result": result}
 
 
 @tool
@@ -139,20 +155,31 @@ def get_stock_price(symbol: str) -> dict:
     using Alpha Vantage. Requires ALPHA_VANTAGE_API_KEY in environment.
     """
     api_key = os.getenv("ALPHA_VANTAGE_API_KEY", "")
-    url = (
-        "https://www.alphavantage.co/query"
-        f"?function=GLOBAL_QUOTE&symbol={symbol}&apikey={api_key}"
-    )
-    r = requests.get(url)
-    return r.json()
+    if not api_key:
+        return {"error": "ALPHA_VANTAGE_API_KEY is not set"}
+    try:
+        r = requests.get(
+            "https://www.alphavantage.co/query",
+            params={"function": "GLOBAL_QUOTE", "symbol": symbol.strip().upper(), "apikey": api_key},
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except (requests.RequestException, ValueError) as e:
+        return {"error": f"Stock API request failed: {e}"}
+    # Alpha Vantage returns HTTP 200 with a "Note"/"Information" field when rate-limited.
+    if "Global Quote" not in data or not data["Global Quote"]:
+        return {"error": data.get("Note") or data.get("Information") or f"No quote found for '{symbol}'"}
+    return data
 
 
 @tool
-def rag_tool(query: str, thread_id: Optional[str] = None) -> dict:
+def rag_tool(query: str, config: RunnableConfig) -> dict:
     """
-    Retrieve relevant information from the uploaded PDF for this chat thread.
-    Always include the thread_id when calling this tool.
+    Retrieve relevant information from the PDF uploaded in this chat.
     """
+    # thread_id is injected from the run config, so the LLM never has to pass it.
+    thread_id = config.get("configurable", {}).get("thread_id")
     retriever = _get_retriever(thread_id)
     if retriever is None:
         return {
@@ -173,7 +200,6 @@ def rag_tool(query: str, thread_id: Optional[str] = None) -> dict:
 
 
 tools = [search_tool, get_stock_price, calculator, rag_tool]
-llm_with_tools = llm.bind_tools(tools)
 
 # -------------------
 # 4. State
@@ -183,58 +209,125 @@ class ChatState(TypedDict):
 
 
 # -------------------
-# 5. Nodes
+# 5. Checkpointer
 # -------------------
-def chat_node(state: ChatState, config=None):
-    """LLM node that may answer or request a tool call."""
-    thread_id = None
-    if config and isinstance(config, dict):
-        thread_id = config.get("configurable", {}).get("thread_id")
-
-    system_message = SystemMessage(
-        content=(
-            "You are a helpful assistant. For questions about the uploaded PDF, call "
-            "the `rag_tool` and include the thread_id "
-            f"`{thread_id}`. You can also use the web search, stock price, and "
-            "calculator tools when helpful. If no document is available, ask the user "
-            "to upload a PDF."
-        )
-    )
-
-    messages = [system_message, *state["messages"]]
-    response = llm_with_tools.invoke(messages, config=config)
-    return {"messages": [response]}
-
-
-tool_node = ToolNode(tools)
-
-# -------------------
-# 6. Checkpointer
-# -------------------
-conn = sqlite3.connect(database="chatbot.db", check_same_thread=False)
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chatbot.db")
+conn = sqlite3.connect(database=DB_PATH, check_same_thread=False)
 checkpointer = SqliteSaver(conn=conn)
 
 # -------------------
-# 7. Graph
+# 6. Nodes + Graph
 # -------------------
-graph = StateGraph(ChatState)
-graph.add_node("chat_node", chat_node)
-graph.add_node("tools", tool_node)
+def build_chatbot(api_key: Optional[str] = None):
+    """
+    Build the chatbot graph using the given Gemini key (or the default key).
+    All chatbots share the same SQLite checkpointer, so chat history is the same.
+    """
+    llm_with_tools = make_llm(api_key).bind_tools(tools)
 
-graph.add_edge(START, "chat_node")
-graph.add_conditional_edges("chat_node", tools_condition)
-graph.add_edge("tools", "chat_node")
+    def chat_node(state: ChatState, config: RunnableConfig):
+        """LLM node that may answer or request a tool call."""
+        system_message = SystemMessage(
+            content=(
+                # The model doesn't know today's date, so we tell it. Without this it
+                # trusts its old training data over fresh web search results.
+                f"Today's date is {date.today():%d %B %Y}. "
+                "You are a helpful assistant. For questions about the uploaded PDF, call "
+                "the `rag_tool`. You can also use the web search, stock price, and "
+                "calculator tools when helpful. If no document is available, ask the user "
+                "to upload a PDF."
+            )
+        )
 
-chatbot = graph.compile(checkpointer=checkpointer)
+        messages = [system_message, *state["messages"]]
+        response = llm_with_tools.invoke(messages, config=config)
+        return {"messages": [response]}
+
+    graph = StateGraph(ChatState)
+    graph.add_node("chat_node", chat_node)
+    graph.add_node("tools", ToolNode(tools))
+
+    graph.add_edge(START, "chat_node")
+    graph.add_conditional_edges("chat_node", tools_condition)
+    graph.add_edge("tools", "chat_node")
+
+    return graph.compile(checkpointer=checkpointer)
+
+
+# Default chatbot that uses the key from .env
+chatbot = build_chatbot()
 
 # -------------------
-# 8. Helpers
+# 7. Helpers
 # -------------------
 def retrieve_all_threads():
-    all_threads = set()
+    # checkpointer.list() gives the newest checkpoints first.
+    # A dict keeps that order and removes duplicates (a set would shuffle them).
+    all_threads = {}
     for checkpoint in checkpointer.list(None):
-        all_threads.add(checkpoint.config["configurable"]["thread_id"])
-    return list(all_threads)
+        all_threads[checkpoint.config["configurable"]["thread_id"]] = True
+    # Return oldest first, because the frontend reverses the list to show newest on top
+    return list(all_threads)[::-1]
+
+
+# -------------------
+# 8. Chat titles
+# -------------------
+conn.execute("CREATE TABLE IF NOT EXISTS chat_titles (thread_id TEXT PRIMARY KEY, title TEXT)")
+conn.commit()
+
+
+def save_title(thread_id: str, title: str):
+    conn.execute(
+        "INSERT OR REPLACE INTO chat_titles (thread_id, title) VALUES (?, ?)",
+        (str(thread_id), title),
+    )
+    conn.commit()
+
+
+def has_title(thread_id: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM chat_titles WHERE thread_id = ?", (str(thread_id),)
+    ).fetchone()
+    return row is not None
+
+
+def short_text(text: str, max_len: int = 40) -> str:
+    """Cut long text to max_len characters, adding … at the end."""
+    text = " ".join(text.split())  # remove extra spaces and newlines
+    return text if len(text) <= max_len else text[: max_len - 1] + "…"
+
+
+def generate_title(first_message: str, api_key: Optional[str] = None) -> str:
+    """Ask Gemini for a short chat title. If that fails, use the message itself."""
+    prompt = (
+        "Generate a concise 3 to 5 word title for a chat that starts with this message:\n"
+        f'"{first_message}"\n'
+        "Return ONLY the title, no quotes or punctuation."
+    )
+    try:
+        title = make_llm(api_key).invoke(prompt).text.strip().strip('"').strip()
+        if title:
+            return short_text(title)
+    except Exception:
+        pass  # e.g. rate limit -> use the fallback below
+    return short_text(first_message)
+
+
+def get_chat_title(thread_id: str) -> str:
+    """Title for the sidebar: saved title -> first user message -> 'New chat'."""
+    row = conn.execute(
+        "SELECT title FROM chat_titles WHERE thread_id = ?", (str(thread_id),)
+    ).fetchone()
+    if row:
+        return row[0]
+
+    # Old chats made before titles existed: use their first message
+    state = chatbot.get_state(config={"configurable": {"thread_id": str(thread_id)}})
+    for msg in state.values.get("messages", []):
+        if msg.type == "human":
+            return short_text(msg.text)
+    return "New chat"
 
 
 def thread_has_document(thread_id: str) -> bool:
