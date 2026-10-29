@@ -2,7 +2,7 @@
 
 A chatbot built with LangGraph and Google Gemini that can answer questions about a PDF you upload, search the web, look up stock prices and solve math expressions. The agent decides by itself which tool to use for each question. The UI is made with Streamlit.
 
-**Live demo:** coming soon <!-- add Render URL here -->
+**Live demo:** https://multi-utility-chatbot-3rxj.onrender.com (free instance, the first load can take up to a minute)
 
 <!-- ![Demo](assets/demo.gif) -->
 
